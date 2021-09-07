@@ -53,7 +53,11 @@ constFeedZgcode = 'G01 Z{} F{} (Changed from: "{}")\n'
 constFeedXYgcode = 'G01 {} F{} (Changed from: "{}")\n'
 constFeedXYZgcode = 'G01 {} Z{} F{} (Changed from: "{}")\n'
 constAddFeedGcode = " F{} (Feed rate added)\n"
+constRapidLatheGcode = 'G00 {} (Changed from: "{}")\n'
+constFeedLatheGcode = 'G01 {} (Changed from: "{}")\n'
+constBaseLatheGcode = 'G00 {}{} F{} (Changed from: "{}")\n'
 constMotionGcodeSet = {0,1,2,3,33,38,73,76,80,81,82,84,85,86,87,88,89}
+constLatheModeSet = {7,8}
 constLineNumInc = 5
 
 # Tool tip text
@@ -906,6 +910,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
 
         if fFastZenabled:
             regGcode = re.compile(r""
+                "(?P<G90>G90)?[^XYZFG]*"
                 "(G(?P<G>[0-9]+(\.[0-9]*)?)[^XYZF]*)?"
                 "(?P<XY>((X-?[0-9]+(\.[0-9]*)?)[^XYZF]*)?"
                 "((Y-?[0-9]+(\.[0-9]*)?)[^XYZF]*)?)"
@@ -913,8 +918,8 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
                 "(F(?P<F>-?[0-9]+(\.[0-9]*)?)[^XYZF]*)?",
                 re.IGNORECASE)
 
-        i = 0;
-        ops = setup.allOperations;
+        i = 0
+        ops = setup.allOperations
         while i < ops.count:
             op = ops[i]
             i += 1
@@ -1019,7 +1024,7 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
                 if regToolComment.match(line) != None:
                     fileHead.write(line)
                     line = fileOp.readline()
-                    break;
+                    break
 
                 if fFirst:
                     pos = line.upper().find(opName.upper())
@@ -1033,10 +1038,16 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
                     fileHead.write(line)
                 line = fileOp.readline()
 
+            latheMode = False
             # Body starts at tool code, T
             fBody = False
             while True:
-                match = regBody.match(line).groupdict();
+                match = regBody.match(line).groupdict()
+                GcodeTmp = match["G"]
+                if GcodeTmp != None:
+                    GcodeTmp = int(float(GcodeTmp))
+                    if GcodeTmp in constLatheModeSet:
+                        latheMode = True
                 line = match["line"]        # filter off line number if present
                 fNum = match["N"] != None
                 if (fBody):
@@ -1083,6 +1094,12 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
             feedCur = 0
             fFirstG1 = False
             fLockSpeed = False
+            latheRapid = None
+            latheHomeX = None
+            latheHomeZ = None
+            latheInRapid = False
+            latheSafeX = False
+            latheSafeZ = False
 
             # Note that match, line, and fNum are already set
             while True:
@@ -1103,12 +1120,88 @@ def PostProcessSetup(fname, setup, setupFolder, docSettings):
                     if endMark in endGcodeSet:
                         break
 
-                if fFastZ:
-                    # Analyze code for chances to make rapid moves
-                    match = regGcode.match(line)
-                    if match.end() != 0:
+                # Analyze code for chances to make rapid moves
+                match = regGcode.match(''.join(line.split())) # whitespace in gcode confuses the regex
+                if match.end() != 0 and fFastZ:
+                    match = match.groupdict()
+                    # blank XY comes up as empty string. Makes the logic harder
+                    if match["XY"] == '':
+                        match["XY"] = None
+                    
+                    if latheMode:
+                        # The stategy Fusion seems to use for turning operations involves
+                        # setting up a safe baseline and then making multiple passes out from that
+                        # while incrementing along the baseline for each passe
+                        # each pass has a straight return to the baseline which we can rapid
+                        # also lateral moves along the baseline can be rapid
+                        # setting up the operation is a two-line pattern from which we derive
+                        # the axis and offset of the baseline
+                        # for a turning operation our safe baseline has a constant Z so
+                        # and lines that only Z to that value are the returns
+
                         try:
-                            match = match.groupdict()
+                            if fLockSpeed:
+                                pass
+                            elif latheInRapid:
+                                # get out of rapid ASAP
+                                if all([match[x] == None for x in (match.keys() - ["XY","F"])]) and match["XY"] != None and latheSafeZ:
+                                    # one X move along our safe Z is ok to stay rapid
+                                    latheSafeX = latheSafeZ = False
+                                    pass
+                                elif all([match[x] == None for x in (match.keys() - ["Z","F"])]) and match["Z"] != None and latheSafeX:
+                                    # one Z move along our safe X is ok to stay rapid
+                                    latheSafeX = latheSafeZ = False
+                                    pass
+                                else:
+                                    # get out of rapid
+                                    latheInRapid = False
+                                    if match["G"] == None or match["G"] not in constMotionGcodeSet:
+                                        line = constFeedLatheGcode.format(line[:-1], line[:-1])
+                            elif match["G90"] == "G90" and match["G"] == "0" and match["XY"] != None and match["Z"] != None and all([match[x] == None for x in (match.keys() - ["G90","G","XY","Z"])]):
+                                # look for our first line, which has e.g. G90 G0 X1 Z1
+                                # One of those is the home value for the direction we will fast home to. Both are safe, as they are G0.
+                                latheHomeX = match["XY"] # this will do or do not - there is no y
+                                latheHomeZ = match["Z"]
+                                latheRapid = None                             
+                                latheSafeX = latheSafeZ = True
+                            elif match["G"] == "1" and latheRapid == None and match["F"] != None and all([match[x] == None for x in (match.keys() - ["G","XY","Z","F"])]):
+                                # this line is expected next. We are looking for a lateral move along the baseline that also sets Feed
+                                # as this sets our feed, we don't have to remember it                    
+                                # as it's a lateral along our safe line, we can rapid it            
+                                if match["Z"] != None and latheHomeX != None:
+                                    latheHomeZ = match["Z"]
+                                    latheRapid = "X"
+                                    latheSafeX = latheSafeZ = latheInRapid = True
+                                    line = constBaseLatheGcode.format('Z', match["Z"], match["F"], line[:-1])
+                                elif match ["XY"] != None and latheHomeZ != None:
+                                    latheHomeX = match["XY"] # this will do or do not - there is no y
+                                    latheRapid = "Z"
+                                    latheSafeX = latheSafeZ = latheInRapid = True
+                                    line = constBaseLatheGcode.format('', match["XY"], match["F"], line[:-1])
+                            elif latheRapid == None:
+                                # we don't know how to rapid - skip
+                                pass
+                            elif not all([match[x] == None for x in (match.keys() - ["XY","Z","F"])]):
+                                # skip lines that are not just an X or Z
+                                latheSafeX = latheSafeZ = False
+                                pass        
+                            elif match["XY"] == latheHomeX and match["Z"] == None:
+                                # facing rapid return
+                                line = constRapidLatheGcode.format(line[:-1], line[:-1])
+                                latheInRapid = True
+                                latheSafeX = True
+                                latheSafeZ = False
+                            elif match["Z"] == latheHomeZ and match["XY"] == None:
+                                # turning rapid return
+                                line = constRapidLatheGcode.format(line[:-1], line[:-1])
+                                latheInRapid = True                                
+                                latheSafeZ = True
+                                latheSafeX = False
+                        except:
+                            fFastZ = False # Just skip changes
+
+                    else: # not latheMode
+                        try:
                             GcodeTmp = match["G"]
                             if GcodeTmp != None:
                                 GcodeTmp = int(float(GcodeTmp))
